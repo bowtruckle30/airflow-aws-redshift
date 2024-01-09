@@ -1,10 +1,13 @@
-
 import requests
 from airflow.decorators import dag, task
 import datetime
 import pendulum
 import json
 import pandas as pd
+import s3fs
+from helper.etl import extract_and_save_to_s3, load_parquet_to_stg_tbl
+from helper.sql_queries import SQLQueries
+from airflow.providers.postgres.hooks.postgres import PostgresHook
 
 @dag(
     dag_id="nytimes_news",
@@ -16,41 +19,39 @@ def process_nytimes_news():
 
     @task
     def extract():
-        api_url = 'https://api.nytimes.com/svc/news/v3/content/nyt/world.json?api-key=gv4txZ8wLsKZoaOtQ0P0vtpvALB8f2A5'
-        response = requests.get(api_url)
-        response_data = response.json()
-        results = response_data['results']
-
-        data = []
-        for res in results:
-            data_dict = {}
-            data_dict['slug_name'] = res['slug_name']
-            data_dict['section'] = res['section']
-            data_dict['subsection'] = res['subsection']
-            data_dict['title'] = res['title']
-            data_dict['abstract'] = res['abstract']
-            data_dict['uri'] = res['uri']
-            data_dict['url'] = res['url']
-            data_dict['byline'] = res['byline']
-            data_dict['item_type'] = res['item_type']
-            data_dict['source'] = res['source']
-            data_dict['updated_date'] = res['updated_date']
-            data_dict['created_date'] = res['created_date']
-            data_dict['published_date'] = res['published_date']
-            data_dict['first_published_date'] = res['first_published_date']
-            data_dict['material_type_facet'] = res['material_type_facet']
-
-            data.append(data_dict)
-        
-        print(data[0])
-        print('data count: ', len(data))
-        
-        df = pd.DataFrame(data)
-        ct = datetime.datetime.now()
-        output_filename = 'data_' + str(ct.year) + '_' + str(ct.month) + '_' + str(ct.day)
-        df.to_csv('/opt/airflow/dags/nytimes_data/{}.csv'.format(output_filename), index = False)
+        extract_and_save_to_s3()
     
-    extract()
+    @task
+    def load_stg_tbl():
+        load_parquet_to_stg_tbl()
+    
+    @task
+    def upsert_mio():
+        query = SQLQueries.upsert_query
+        try:
+            postgres_hook = PostgresHook(postgres_conn_id="nytimes_pg_conn")
+            conn = postgres_hook.get_conn()
+            cur = conn.cursor()
+            cur.execute(query)
+            conn.commit()
+            return 0
+        except Exception as e:
+            return 1
+    
+    @task
+    def del_stg_table():
+        query = SQLQueries.delete_stg_table_query
+        try:
+            postgres_hook = PostgresHook(postgres_conn_id="nytimes_pg_conn")
+            conn = postgres_hook.get_conn()
+            cur = conn.cursor()
+            cur.execute(query)
+            conn.commit()
+            return 0
+        except Exception as e:
+            return 1
+        
+    extract() >> load_stg_tbl() >> upsert_mio() >> del_stg_table()
 
 dag = process_nytimes_news()
          
